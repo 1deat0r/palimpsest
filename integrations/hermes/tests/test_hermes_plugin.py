@@ -55,6 +55,7 @@ PalimpsestClient = plugin.PalimpsestClient
 PalimpsestConfig = plugin.PalimpsestConfig
 PalimpsestError = plugin.PalimpsestError
 PalimpsestConfigError = plugin.PalimpsestConfigError
+PalimpsestHttpError = plugin.PalimpsestHttpError
 PalimpsestMemoryProvider = plugin.PalimpsestMemoryProvider
 PalimpsestWriteQueue = plugin.PalimpsestWriteQueue
 _content_key = plugin._content_key
@@ -211,6 +212,27 @@ class FakePalimpsestServer:
                 )
                 return False
 
+            def _require_registered_write_policy(
+                self, body: dict | None, send
+            ) -> bool:
+                policy = (body or {}).get("write_policy") or {}
+                registered = policy.get("id") == "direct-evidence" and policy.get(
+                    "version"
+                ) == "1"
+                if registered:
+                    return True
+                send(
+                    422,
+                    {
+                        "type": "https://palimpsest.dev/problems/write-policy-rejected",
+                        "title": "Fact write policy is not registered",
+                        "status": 422,
+                        "code": "write_policy_rejected",
+                        "detail": "Use a write policy registered by the migration authority.",
+                    },
+                )
+                return False
+
             def do_POST(self) -> None:
                 length = int(self.headers.get("Content-Length") or 0)
                 self._record(self.rfile.read(length))
@@ -219,14 +241,14 @@ class FakePalimpsestServer:
                     in {
                         f"{_SCOPE}/retrievals",
                         f"{_SCOPE}/episodes",
-                        f"{_SCOPE}/facts",
+                        f"{_SCOPE}/wiki/facts",
                     }
                     and not self._require_idempotency_key()
                 ):
                     return  # the real server 400s durable calls without the key
                 if self.path in {
                     f"{_SCOPE}/episodes",
-                    f"{_SCOPE}/facts",
+                    f"{_SCOPE}/wiki/facts",
                 } and not self._require_valid_timestamp(server.requests[-1]["body"]):
                     return  # the real server validates observed_at strictly
                 if self.path == f"{_SCOPE}/retrievals":
@@ -276,7 +298,11 @@ class FakePalimpsestServer:
                         self._send,
                     )
                     return
-                if self.path == f"{_SCOPE}/facts":
+                if self.path == f"{_SCOPE}/wiki/facts":
+                    if not self._require_registered_write_policy(
+                        server.requests[-1]["body"], self._send
+                    ):
+                        return
                     server._durable_replay(
                         "facts",
                         self.headers,
@@ -514,16 +540,31 @@ class TestClient(PluginTestCase):
         client = PalimpsestClient(PalimpsestConfig.load(str(self.hermes_home)))
         observed = client.remember("remember this", key="hermes-key-1")
         episodes = self.server.requests_for("POST", "/episodes")
-        facts = self.server.requests_for("POST", "/facts")
+        facts = self.server.requests_for("POST", "/wiki/facts")
         self.assertEqual(len(episodes), 1)
         self.assertEqual(len(facts), 1)
         self.assertEqual(episodes[0]["body"]["kind"], "hermes_memory")
         self.assertEqual(
             episodes[0]["body"]["provenance"]["source_type"], "hermes.memory"
         )
+        self.assertEqual(
+            facts[0]["path"],
+            f"{_SCOPE}/wiki/facts",
+            "facts must be written through the governed create-fact operation",
+        )
         self.assertEqual(facts[0]["body"]["namespace"], "hermes")
         self.assertEqual(
             facts[0]["body"]["write_policy"], {"id": "direct-evidence", "version": "1"}
+        )
+        self.assertNotIn(
+            "valid_time",
+            facts[0]["body"],
+            "the governed create-fact accepts observed_at only (spec 017 V-4)",
+        )
+        self.assertEqual(
+            facts[0]["headers"]["authorization"],
+            "Bearer palimpsest-local-development-token",
+            "the server records the bearer-token principal as the fact writer",
         )
         self.assertEqual(
             facts[0]["body"]["evidence_episode_ids"],
@@ -534,6 +575,39 @@ class TestClient(PluginTestCase):
         )
         self.assertTrue(observed["episode"]["episode_id"])
         self.assertTrue(observed["fact"]["fact_id"])
+
+    def test_remember_never_calls_the_legacy_fact_endpoint(self) -> None:
+        client = PalimpsestClient(PalimpsestConfig.load(str(self.hermes_home)))
+        client.remember("governed only", key="hermes-key-g")
+        legacy = [
+            r
+            for r in self.server.requests
+            if r["method"] == "POST" and r["path"] == f"{_SCOPE}/facts"
+        ]
+        self.assertEqual(
+            legacy,
+            [],
+            "the plugin must not call the deprecated mutation endpoint (017 AC12)",
+        )
+
+    def test_remember_unregistered_write_policy_fails_closed(self) -> None:
+        client = PalimpsestClient(PalimpsestConfig.load(str(self.hermes_home)))
+        with self.assertRaises(PalimpsestHttpError) as caught:
+            client.create_fact(
+                namespace="hermes",
+                key="hermes-key-u",
+                value={"content": "never lands"},
+                observed_at="2026-08-01T12:00:00Z",
+                evidence_episode_ids=["019be000-0000-7000-8000-000000000001"],
+                write_policy={"id": "not-registered", "version": "1"},
+                confidence=1.0,
+                sensitivity="internal",
+                retention_policy_id="standard",
+                idempotency_key="hermes-fact-u",
+            )
+        self.assertEqual(caught.exception.status_code, 422)
+        self.assertEqual(caught.exception.detail.get("code"), "write_policy_rejected")
+        self.assertEqual(len(self.server.requests_for("POST", "/wiki/facts")), 1)
 
     def test_http_error_raises(self) -> None:
         client = PalimpsestClient(PalimpsestConfig.load(str(self.hermes_home)))
@@ -888,7 +962,7 @@ class TestWriteQueue(PluginTestCase):
         self.assertTrue(
             _wait_until(lambda: len(self.server.requests_for("POST", "/episodes")) == 1)
         )
-        self.assertEqual(len(self.server.requests_for("POST", "/facts")), 0)
+        self.assertEqual(len(self.server.requests_for("POST", "/wiki/facts")), 0)
 
     def test_sync_turn_observed_at_is_turn_time_not_flush_time(self) -> None:
         from datetime import datetime, timedelta, timezone
@@ -1040,7 +1114,7 @@ class TestSessionAndMirror(PluginTestCase):
         self.assertTrue(
             _wait_until(lambda: len(self.server.requests_for("POST", "/episodes")) == 1)
         )
-        facts = self.server.requests_for("POST", "/facts")
+        facts = self.server.requests_for("POST", "/wiki/facts")
         self.assertEqual(len(facts), 1)
         expected_key = f"builtin:memory:hermes-{hashlib.sha1(b'a durable preference').hexdigest()[:16]}"
         self.assertEqual(facts[0]["body"]["key"], expected_key)
@@ -1063,7 +1137,7 @@ class TestSessionAndMirror(PluginTestCase):
         provider.on_memory_write("add", "memory", "survives retries")
         self.assertTrue(
             _wait_until(
-                lambda: len(self.server.requests_for("POST", "/facts")) == 1,
+                lambda: len(self.server.requests_for("POST", "/wiki/facts")) == 1,
                 timeout=5.0,
             )
         )
@@ -1102,7 +1176,7 @@ class TestSessionAndMirror(PluginTestCase):
             )
         )
         episodes = self.server.requests_for("POST", "/episodes")
-        facts = self.server.requests_for("POST", "/facts")
+        facts = self.server.requests_for("POST", "/wiki/facts")
         self.assertEqual(len(episodes), 2, "one stored write + one replay")
         self.assertEqual(len(facts), 1, "the fact completes on the retry")
         self.assertEqual(
@@ -1123,7 +1197,9 @@ class TestSessionAndMirror(PluginTestCase):
         provider = self.make_provider()
         provider.on_memory_write("add", "memory", "mirror once")
         self.assertTrue(
-            _wait_until(lambda: len(self.server.requests_for("POST", "/facts")) == 1)
+            _wait_until(
+                lambda: len(self.server.requests_for("POST", "/wiki/facts")) == 1
+            )
         )
         provider.on_memory_write("add", "memory", "mirror once")
         self.assertTrue(
@@ -1132,7 +1208,7 @@ class TestSessionAndMirror(PluginTestCase):
                 timeout=5.0,
             )
         )
-        self.assertEqual(len(self.server.requests_for("POST", "/facts")), 1)
+        self.assertEqual(len(self.server.requests_for("POST", "/wiki/facts")), 1)
 
 
 # -- invariants ---------------------------------------------------------------

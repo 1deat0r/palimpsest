@@ -415,7 +415,6 @@ class PalimpsestClient:
         key: str,
         value: Any,
         observed_at: str,
-        valid_time: Mapping[str, Any],
         evidence_episode_ids: Sequence[str],
         write_policy: Mapping[str, Any],
         confidence: float,
@@ -429,7 +428,6 @@ class PalimpsestClient:
             "key": key,
             "value": value,
             "observed_at": _normalize_timestamp(observed_at),
-            "valid_time": dict(valid_time),
             "evidence_episode_ids": list(evidence_episode_ids),
             "write_policy": dict(write_policy),
             "confidence": confidence,
@@ -438,7 +436,7 @@ class PalimpsestClient:
         }
         return self._request(
             "POST",
-            f"{self._scope_path()}/facts",
+            f"{self._scope_path()}/wiki/facts",
             body=body,
             idempotency_key=_idempotency_key(idempotency_key),
         )
@@ -487,7 +485,6 @@ class PalimpsestClient:
             key=key or _content_key(content),
             value={"content": content, "metadata": dict(metadata or {})},
             observed_at=observed_at,
-            valid_time={"from": observed_at},
             evidence_episode_ids=[episode_id],
             write_policy={"id": "direct-evidence", "version": "1"},
             confidence=confidence,
